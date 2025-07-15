@@ -75,6 +75,28 @@ leaderElectionService.on("leaderLost", () => {
 
 ---
 
+## 📝 Logger
+
+You can provide a custom logger via the `logger` option. The logger must implement `info`, `debug`, and `error` methods (compatible with the standard console API):
+
+```ts
+const myLogger = {
+  info: (...args) => console.log("[info]", ...args),
+  debug: (...args) => {}, // Disable debug in production if needed
+  error: (...args) => console.error("[error]", ...args),
+};
+
+const leaderElectionService = new LeaderElectionService({
+  leaseName: "my-lease",
+  logger: myLogger,
+});
+```
+
+- If you do not provide a logger, `info` and `debug` logs are suppressed by default, and only `error` logs are sent to `console.error`.
+- You can integrate any logging library (such as winston, pino, bunyan, etc.) as long as it matches the required interface.
+
+---
+
 ## 💹 Events
 
 Use `.on(eventName, handler)` to listen:

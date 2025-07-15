@@ -1,6 +1,6 @@
 {
   "name": "leader-election",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Lightweight leader-election utility for Node.js services on Kubernetes, powered by Lease objects.",
   "main": "lib/index.js",
   "types": "lib/index.d.ts",

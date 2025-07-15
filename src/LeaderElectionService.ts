@@ -1,6 +1,20 @@
 import { CoordinationV1Api, KubeConfig, V1Lease, V1MicroTime, Watch } from "@kubernetes/client-node";
 import { EventEmitter } from "events";
 
+export interface Logger {
+    debug: (...args: any[]) => void;
+    info: (...args: any[]) => void;
+    error: (...args: any[]) => void;
+}
+
+const defaultLogger: Logger = {
+    debug: () => {},
+    info: () => {},
+    error: (...args: any[]) => {
+        console.error(...args);
+    },
+};
+
 export class LeaderElectionService {
     private kubeClient: CoordinationV1Api;
     private watch: Watch;
@@ -13,16 +27,18 @@ export class LeaderElectionService {
     private notLeaderRetryTimeout: NodeJS.Timeout | null = null;
     private awaitLeadership: boolean;
     private readonly eventEmitter: EventEmitter;
+    private readonly logger: Logger;
     LEADER_IDENTITY = `${process.env.HOSTNAME}`;
 
-    constructor(options: { leaseName?: string; namespace?: string; renewalInterval?: number; awaitLeadership?: boolean }) {
+    constructor(options: { leaseName?: string; namespace?: string; renewalInterval?: number; awaitLeadership?: boolean; logger?: Logger }) {
+        this.logger = options.logger ?? defaultLogger;
         const kubeConfig = new KubeConfig();
         if (process.env.KUBERNETES_SERVICE_HOST) {
             kubeConfig.loadFromDefault();
             this.kubeClient = kubeConfig.makeApiClient(CoordinationV1Api);
             this.watch = new Watch(kubeConfig);
         } else {
-            console.info("Not running in Kubernetes environment. Leader election will be simulated.");
+            this.logger.info("Not running in Kubernetes environment. Leader election will be simulated.");
             this.kubeClient = null as any;
             this.watch = null as any;
         }
@@ -40,7 +56,7 @@ export class LeaderElectionService {
 
     async initialize() {
         if (!process.env.KUBERNETES_SERVICE_HOST) {
-            console.info("Not running in Kubernetes, assuming leadership...");
+            this.logger.info("Not running in Kubernetes, assuming leadership...");
             process.nextTick(() => {
                 this.isLeader = true;
                 this.emitLeaderElectedEvent();
@@ -52,7 +68,7 @@ export class LeaderElectionService {
                 await this.runLeaderElectionProcess();
             } else {
                 this.runLeaderElectionProcess().catch((error) => {
-                    console.error({
+                    this.logger.error({
                         message: "Leader election process failed",
                         error,
                     });
@@ -72,18 +88,18 @@ export class LeaderElectionService {
     }
 
     private async tryToBecomeLeader() {
-        console.info("Trying to become leader...");
+        this.logger.info("Trying to become leader...");
         try {
             let lease: V1Lease = await this.getLease();
             if (this.isLeaseExpired(lease) || !lease.spec?.holderIdentity) {
-                console.info("Lease expired or not held. Attempting to become leader...");
+                this.logger.info("Lease expired or not held. Attempting to become leader...");
                 lease = await this.acquireLease(lease);
             }
             if (this.isLeaseHeldByUs(lease)) {
                 this.becomeLeader();
             }
         } catch (error) {
-            console.error({
+            this.logger.error({
                 message: "Error while trying to become leader",
                 error,
             });
@@ -101,10 +117,10 @@ export class LeaderElectionService {
 
         try {
             const { body } = await this.kubeClient.replaceNamespacedLease(this.leaseName, this.namespace, lease);
-            console.info("Successfully acquired lease");
+            this.logger.info("Successfully acquired lease");
             return body;
         } catch (error) {
-            console.error({ message: "Error while acquiring lease", error });
+            this.logger.error({ message: "Error while acquiring lease", error });
             throw error;
         }
     }
@@ -113,21 +129,21 @@ export class LeaderElectionService {
         try {
             let lease: V1Lease = await this.getLease();
             if (this.isLeaseHeldByUs(lease)) {
-                console.debug("Renewing lease...");
+                this.logger.debug("Renewing lease...");
                 lease.spec!.renewTime = new V1MicroTime(new Date());
                 try {
                     const { body } = await this.kubeClient.replaceNamespacedLease(this.leaseName, this.namespace, lease);
-                    console.debug("Successfully renewed lease");
+                    this.logger.debug("Successfully renewed lease");
                     return body;
                 } catch (error) {
-                    console.error({ message: "Error while renewing lease", error });
+                    this.logger.error({ message: "Error while renewing lease", error });
                     throw error;
                 }
             } else {
                 this.loseLeadership();
             }
         } catch (error) {
-            console.error({ message: "Error while renewing lease", error });
+            this.logger.error({ message: "Error while renewing lease", error });
             this.loseLeadership();
         }
     }
@@ -138,7 +154,7 @@ export class LeaderElectionService {
             return body;
         } catch (error) {
             if (error instanceof Error && (error as any).response?.statusCode === 404) {
-                console.info("Lease not found. Creating lease...");
+                this.logger.info("Lease not found. Creating lease...");
                 return this.createLease();
             } else {
                 throw error;
@@ -162,10 +178,10 @@ export class LeaderElectionService {
 
         try {
             const { body } = await this.kubeClient.createNamespacedLease(this.namespace, lease);
-            console.info("Successfully created lease");
+            this.logger.info("Successfully created lease");
             return body;
         } catch (error) {
-            console.error({ message: "Failed to create lease", error });
+            this.logger.error({ message: "Failed to create lease", error });
             throw error;
         }
     }
@@ -181,7 +197,7 @@ export class LeaderElectionService {
     }
 
     private async gracefulShutdown() {
-        console.info("Graceful shutdown initiated");
+        this.logger.info("Graceful shutdown initiated");
         if (this.isLeader) {
             await this.releaseLease();
         }
@@ -194,21 +210,21 @@ export class LeaderElectionService {
                 lease.spec!.holderIdentity = undefined;
                 lease.spec!.renewTime = undefined;
                 await this.kubeClient.replaceNamespacedLease(this.leaseName, this.namespace, lease);
-                console.info(`Lease for ${this.leaseName} released.`);
+                this.logger.info(`Lease for ${this.leaseName} released.`);
             }
         } catch (error) {
-            console.error({ message: "Failed to release lease", error });
+            this.logger.error({ message: "Failed to release lease", error });
         }
     }
 
     private emitLeaderElectedEvent() {
         this.eventEmitter.emit("leaderElected", { leaseName: this.leaseName });
-        console.info(`Instance became the leader for lease: ${this.leaseName}`);
+        this.logger.info(`Instance became the leader for lease: ${this.leaseName}`);
     }
 
     private emitLeadershipLostEvent() {
         this.eventEmitter.emit("leaderLost", { leaseName: this.leaseName });
-        console.info(`Instance lost the leadership for lease: ${this.leaseName}`);
+        this.logger.info(`Instance lost the leadership for lease: ${this.leaseName}`);
     }
 
     private becomeLeader() {
@@ -254,7 +270,7 @@ export class LeaderElectionService {
                 {},
                 (type, apiObj) => {
                     if (apiObj && apiObj.metadata.name === this.leaseName) {
-                        console.debug(`Watch event type: ${type} for lease: ${this.leaseName}`);
+                        this.logger.debug(`Watch event type: ${type} for lease: ${this.leaseName}`);
                         switch (type) {
                             case "ADDED":
                             case "MODIFIED":
@@ -268,18 +284,18 @@ export class LeaderElectionService {
                 },
                 (err) => {
                     if (err) {
-                        console.error({
+                        this.logger.error({
                             message: `Watch for lease ended with error: ${err}, trying again in 5 seconds`,
                             error: err,
                         });
                     } else {
-                        console.info("Watch for lease gracefully closed");
+                        this.logger.info("Watch for lease gracefully closed");
                     }
                     setTimeout(() => this.watchLeaseObject(), 5000);
                 }
             );
         } catch (err) {
-            console.error(`Failed to start watch for lease: ${err}, trying again in 5 seconds`);
+            this.logger.error(`Failed to start watch for lease: ${err}, trying again in 5 seconds`);
             setTimeout(() => this.watchLeaseObject(), 5000);
         }
     }
@@ -294,7 +310,7 @@ export class LeaderElectionService {
                 try {
                     await this.renewLease();
                 } catch (error) {
-                    console.error({ message: "Error while renewing lease", error });
+                    this.logger.error({ message: "Error while renewing lease", error });
                 }
             }
         }, this.renewalInterval);
@@ -318,7 +334,7 @@ export class LeaderElectionService {
     private handleLeaseDeletion() {
         if (!this.isLeader) {
             this.tryToBecomeLeader().catch((error) => {
-                console.error({
+                this.logger.error({
                     message: "Error while trying to become leader after lease deletion",
                     error,
                 });
