@@ -102,7 +102,7 @@ await leaderElectionService.gracefulShutdown();
 
 When not running in Kubernetes (i.e. no `KUBERNETES_SERVICE_HOST`), the service simulates leadership:
 
-```bash
+```log
 Not running in Kubernetes environment. Leader election will be simulated.
 ```
 
