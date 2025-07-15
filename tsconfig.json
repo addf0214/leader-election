@@ -1,0 +1,17 @@
+{
+    "compilerOptions": {
+        "outDir": "lib",
+        "lib": [
+            "es2024"
+        ],
+        "module": "nodenext",
+        "target": "es2022",
+        "strict": true,
+        "esModuleInterop": true,
+        "skipLibCheck": true,
+        "moduleResolution": "node16"
+    },
+    "include": [
+        "src"
+    ]
+}

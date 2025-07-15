@@ -1,0 +1,39 @@
+{
+  "name": "leader-election",
+  "version": "1.0.0",
+  "description": "Lightweight leader-election utility for Node.js services on Kubernetes, powered by Lease objects.",
+  "main": "lib/index.js",
+  "types": "lib/index.d.ts",
+  "scripts": {
+    "build": "tsc",
+    "prepublishOnly": "npm run build",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/addf0214/leader-election.git"
+  },
+  "files": [
+    "lib/**/*",
+    "README.md"
+  ],
+  "keywords": [
+    "leader-election",
+    "kubernetes",
+    "cluster",
+    "distributed"
+  ],
+  "author": "Addf",
+  "license": "ISC",
+  "bugs": {
+    "url": "https://github.com/addf0214/leader-election/issues"
+  },
+  "homepage": "https://github.com/addf0214/leader-election#readme",
+  "dependencies": {
+    "@kubernetes/client-node": "^0.22.3"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.13",
+    "typescript": "^5.8.3"
+  }
+}
