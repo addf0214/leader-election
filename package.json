@@ -33,7 +33,7 @@
     "@kubernetes/client-node": "^0.22.3"
   },
   "devDependencies": {
-    "@types/node": "^24.0.13",
-    "typescript": "^5.8.3"
+    "@types/node": "^24.19.2",
+    "typescript": "^6.0.3"
   }
 }
