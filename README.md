@@ -1,143 +1,85 @@
-# Leader Election for Node.js on Kubernetes
+# Leader Election
 
-A lightweight and zero-dependency leader election utility for Node.js services running in Kubernetes, using [Lease objects](https://kubernetes.io/docs/concepts/architecture/leases/) as the coordination mechanism.
+Leader election for Node.js services using Kubernetes [Lease objects](https://kubernetes.io/docs/concepts/architecture/leases/). Written in TypeScript, with no framework dependency.
 
-> ⚙️ Written in TypeScript.  
-> 🪶 No bundler required.  
-> 🔁 Graceful fallback when not running in Kubernetes.
+## Why this project
 
-This project is inspired by [Precise-Finance/nestjs-k8s-leader-election](https://github.com/Precise-Finance/nestjs-k8s-leader-election), but is rewritten from scratch due to:
+Inspired by [Precise-Finance/nestjs-k8s-leader-election](https://github.com/Precise-Finance/nestjs-k8s-leader-election), this project was rewritten to remove the NestJS dependency and address bugs in lease renewal, leadership changes, and error handling. The aim is a small library that can be used directly in any Node.js service.
 
-1. The original being tightly coupled with NestJS
-2. Several critical bugs in behavior and error handling
+## Features
 
----
+- Coordinates instances through the Kubernetes Lease API.
+- Emits `leaderElected` and `leaderLost` events to start and stop leader tasks.
+- Can wait for leadership before initialization completes.
+- Renews leases automatically and detects leadership loss through Watch notifications, renewal failures, and lease expiry.
+- Simulates leadership for local development outside Kubernetes.
 
-## ✨ Features
+## Installation
 
-- Uses Kubernetes **Coordination API** (`Lease`) for safe leader election
-- Emits **`leaderElected`** and **`leaderLost`** events
-- Optionally blocks until leadership is acquired
-- Gracefully simulates leadership in non-Kubernetes environments (e.g., local dev)
-- Supports auto-renewal and lease loss detection
-
----
-
-## 📦 Installation
-
-```bash
-pnpm add leader-election
-# or
+```sh
 npm install leader-election
+# or
+pnpm add leader-election
 ```
 
-> Requires:
->
-> - Node.js ≥ 14
-> - Kubernetes ≥ 1.14 (with coordination.k8s.io API group enabled)
-> - `@kubernetes/client-node` as a peer dependency
+Requires Node.js 20.16.0 or later and Kubernetes 1.14 or later with the coordination API enabled. The package includes `@kubernetes/client-node` 0.22.x.
 
----
+The service account needs `get`, `create`, `update`, and `watch` permissions on `leases` in the `coordination.k8s.io` API group.
 
-## 🚀 Usage
+## Usage
 
 ```ts
 import { LeaderElectionService } from "leader-election";
 
-const leaderElectionService = new LeaderElectionService({
-  leaseName: options.LeaderElection.leaseName,
-  awaitLeadership: false,
+const election = new LeaderElectionService({
+  leaseName: "background-jobs",
 });
 
-await leaderElectionService.initialize();
-
-leaderElectionService.on("leaderElected", async () => {
-  // do something as leader
+election.on("leaderElected", () => {
+  // Start leader tasks.
 });
 
-leaderElectionService.on("leaderLost", () => {
-  // clean up leadership tasks
+election.on("leaderLost", () => {
+  // Stop leader tasks.
 });
+
+await election.initialize();
 ```
 
----
+Register listeners before calling `initialize()`. Call it once per instance; subsequent calls reject. Both events receive `{ leaseName }`. As with Node.js EventEmitter, async listeners are not awaited.
 
-## 🧩 API
+The leader renews its lease on a timer and gives up leadership on renewal failure or expiry. Watch notifications detect lease changes sooner, while periodic retries handle expiry and Watch interruptions. Each instance has a unique identity, including when processes share a hostname.
 
-### `new LeaderElectionService(options)`
+## Options
 
-| Option            | Type      | Default                 | Description                                |
-| ----------------- | --------- | ----------------------- | ------------------------------------------ |
-| `leaseName`       | `string`  | `"cst-leader-election"` | Name of the Kubernetes Lease object        |
-| `namespace`       | `string`  | `"default"`             | Kubernetes namespace                       |
-| `renewalInterval` | `number`  | `10000` (ms)            | How often to renew the lease               |
-| `awaitLeadership` | `boolean` | `false`                 | If true, `initialize()` waits until leader |
+| Option | Default | Description |
+| --- | --- | --- |
+| `leaseName` | `"leader-election"` | Lease name. Use the same name for competing instances. |
+| `namespace` | `NAMESPACE` or `"default"` | Kubernetes namespace. |
+| `renewalInterval` | `10000` | Renewal and retry interval in milliseconds; also the Lease API request timeout. |
+| `awaitLeadership` | `false` | Make `initialize()` wait until this instance becomes leader. |
+| `logger` | Errors only | Object with `info`, `debug`, and `error` methods. |
 
----
+`renewalInterval` must be an integer from 1 to 1,073,741,000 milliseconds. The lease duration is twice this interval, rounded up to whole seconds.
 
-## 📝 Logger
+By default, only errors are logged through `console.error`. Pass `logger: console` to enable all logs, or supply your own logger.
 
-You can provide a custom logger via the `logger` option. The logger must implement `info`, `debug`, and `error` methods (compatible with the standard console API):
+## Shutdown
+
+The service handles `SIGINT` and `SIGTERM`. You can also shut it down explicitly:
 
 ```ts
-const myLogger = {
-  info: (...args) => console.log("[info]", ...args),
-  debug: (...args) => {}, // Disable debug in production if needed
-  error: (...args) => console.error("[error]", ...args),
-};
-
-const leaderElectionService = new LeaderElectionService({
-  leaseName: "my-lease",
-  logger: myLogger,
-});
+await election.gracefulShutdown();
 ```
 
-- If you do not provide a logger, `info` and `debug` logs are suppressed by default, and only `error` logs are sent to `console.error`.
-- You can integrate any logging library (such as winston, pino, bunyan, etc.) as long as it matches the required interface.
+Shutdown stops timers and Watch, emits `leaderLost` if needed, and attempts to release the lease. A pending `initialize()` waiting for leadership rejects. A stopped instance cannot be restarted.
 
----
+Your application must stop its leader tasks and close its other resources. Shutdown does not wait for election or renewal requests already in flight.
 
-## 💹 Events
+## Local development
 
-Use `.on(eventName, handler)` to listen:
+Without `KUBERNETES_SERVICE_HOST`, the service skips Kubernetes and assumes leadership. This is intended for local development; instances do not coordinate in this mode.
 
-| Event           | Triggered when…                            |
-| --------------- | ------------------------------------------ |
-| `leaderElected` | This instance becomes the leader           |
-| `leaderLost`    | Leadership is lost (expired, revoked, etc) |
+## License
 
----
-
-## 🔐 Graceful Shutdown
-
-The service listens for `SIGINT` / `SIGTERM` and releases the lease before exit.
-
-You can also call this manually:
-
-```ts
-await leaderElectionService.gracefulShutdown();
-```
-
----
-
-## 🧪 Local Development
-
-When not running in Kubernetes (i.e. no `KUBERNETES_SERVICE_HOST`), the service simulates leadership:
-
-```log
-Not running in Kubernetes environment. Leader election will be simulated.
-```
-
----
-
-## 📄 License
-
-MIT © 2025 Addf
-
----
-
-## 🌐 Links
-
-- Kubernetes Lease API: [https://kubernetes.io/docs/reference/kubernetes-api/cluster-resources/lease-v1/](https://kubernetes.io/docs/reference/kubernetes-api/cluster-resources/lease-v1/)
-- @kubernetes/client-node: [https://github.com/kubernetes-client/javascript](https://github.com/kubernetes-client/javascript)
-- Original Inspiration: [https://github.com/Precise-Finance/nestjs-k8s-leader-election](https://github.com/Precise-Finance/nestjs-k8s-leader-election)
+[MIT](LICENSE), copyright 2025 Addf.

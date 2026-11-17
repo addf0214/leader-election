@@ -1,5 +1,6 @@
 import { CoordinationV1Api, KubeConfig, V1Lease, V1MicroTime, Watch } from "@kubernetes/client-node";
 import { EventEmitter } from "events";
+import { randomBytes } from "crypto";
 
 export interface Logger {
     debug: (...args: any[]) => void;
@@ -23,12 +24,20 @@ export class LeaderElectionService {
     private renewalInterval: number;
     private durationInSeconds: number;
     private isLeader = false;
+    private electionInProgress = false;
+    private leaseUpdateVersion = 0;
+    private stopped = false;
+    private initialized = false;
+    private watchRequest: { abort(): void } | null = null;
+    private watchRetryTimeout: NodeJS.Timeout | null = null;
+    private readonly onSignal = () => { void this.gracefulShutdown(); };
     private leaseRenewalTimeout: NodeJS.Timeout | null = null;
+    private leaseExpiryTimeout: NodeJS.Timeout | null = null;
     private notLeaderRetryTimeout: NodeJS.Timeout | null = null;
     private awaitLeadership: boolean;
     private readonly eventEmitter: EventEmitter;
     private readonly logger: Logger;
-    LEADER_IDENTITY = `${process.env.HOSTNAME}`;
+    LEADER_IDENTITY = `${process.env.HOSTNAME ?? "unknown"}-${randomBytes(16).toString("hex")}`;
 
     constructor(options: { leaseName?: string; namespace?: string; renewalInterval?: number; awaitLeadership?: boolean; logger?: Logger }) {
         this.logger = options.logger ?? defaultLogger;
@@ -36,6 +45,9 @@ export class LeaderElectionService {
         if (process.env.KUBERNETES_SERVICE_HOST) {
             kubeConfig.loadFromDefault();
             this.kubeClient = kubeConfig.makeApiClient(CoordinationV1Api);
+            this.kubeClient.addInterceptor((request) => {
+                request.timeout = this.renewalInterval;
+            });
             this.watch = new Watch(kubeConfig);
         } else {
             this.logger.info("Not running in Kubernetes environment. Leader election will be simulated.");
@@ -46,35 +58,56 @@ export class LeaderElectionService {
         this.leaseName = options.leaseName ?? "leader-election";
         this.namespace = options.namespace ?? process.env.NAMESPACE ?? "default";
         this.renewalInterval = options.renewalInterval ?? 10000;
-        this.durationInSeconds = 2 * (this.renewalInterval / 1000);
+        // Keep both renewal and expiry timers within Node's supported delay range.
+        if (!Number.isInteger(this.renewalInterval) || this.renewalInterval < 1 || this.renewalInterval > 1_073_741_000) {
+            throw new RangeError("renewalInterval must be an integer between 1 and 1073741000 milliseconds");
+        }
+        this.durationInSeconds = Math.ceil(2 * this.renewalInterval / 1000);
         this.awaitLeadership = options.awaitLeadership ?? false;
         this.eventEmitter = new EventEmitter();
 
-        process.on("SIGINT", () => this.gracefulShutdown());
-        process.on("SIGTERM", () => this.gracefulShutdown());
+        process.on("SIGINT", this.onSignal);
+        process.on("SIGTERM", this.onSignal);
     }
 
     async initialize() {
+        if (this.stopped) throw new Error("Leader election has been stopped");
+        if (this.initialized) throw new Error("Leader election has already been initialized");
+        this.initialized = true;
+        const leadership = this.awaitLeadership && !this.isLeader ? new Promise<void>((resolve, reject) => {
+            const cleanup = () => {
+                this.eventEmitter.removeListener("leaderElected", onElected);
+                this.eventEmitter.removeListener("shutdown", onShutdown);
+            };
+            const onElected = () => {
+                cleanup();
+                resolve();
+            };
+            const onShutdown = () => {
+                cleanup();
+                reject(new Error("Leader election stopped before leadership was acquired"));
+            };
+            this.eventEmitter.once("leaderElected", onElected);
+            this.eventEmitter.once("shutdown", onShutdown);
+        }) : undefined;
         if (!process.env.KUBERNETES_SERVICE_HOST) {
             this.logger.info("Not running in Kubernetes, assuming leadership...");
             process.nextTick(() => {
+                if (this.stopped) return;
                 this.isLeader = true;
                 this.emitLeaderElectedEvent();
             });
         } else {
             this.watchLeaseObject();
 
-            if (this.awaitLeadership) {
-                await this.runLeaderElectionProcess();
-            } else {
-                this.runLeaderElectionProcess().catch((error) => {
-                    this.logger.error({
-                        message: "Leader election process failed",
-                        error,
-                    });
+            this.runLeaderElectionProcess().catch((error) => {
+                this.logger.error({
+                    message: "Leader election process failed",
+                    error,
                 });
-            }
+            });
         }
+        await leadership;
     }
 
     public on(event: "leaderElected" | "leaderLost", listener: (...args: any[]) => void): void {
@@ -88,21 +121,28 @@ export class LeaderElectionService {
     }
 
     private async tryToBecomeLeader() {
+        if (this.stopped || this.isLeader || this.electionInProgress) return;
+        this.electionInProgress = true;
+        const version = this.leaseUpdateVersion;
         this.logger.info("Trying to become leader...");
         try {
             let lease: V1Lease = await this.getLease();
-            if (this.isLeaseExpired(lease) || !lease.spec?.holderIdentity) {
+            if (this.stopped || version !== this.leaseUpdateVersion) return;
+            if (this.isLeaseExpired(lease) || !lease.spec?.holderIdentity || this.isLeaseHeldByUs(lease)) {
                 this.logger.info("Lease expired or not held. Attempting to become leader...");
                 lease = await this.acquireLease(lease);
             }
-            if (this.isLeaseHeldByUs(lease)) {
-                this.becomeLeader();
+            // A newer ownership notification invalidates this request's result.
+            if (version === this.leaseUpdateVersion && this.isLeaseHeldByUs(lease) && !this.isLeaseExpired(lease)) {
+                this.becomeLeader(lease);
             }
         } catch (error) {
             this.logger.error({
                 message: "Error while trying to become leader",
                 error,
             });
+        } finally {
+            this.electionInProgress = false;
         }
     }
 
@@ -115,36 +155,31 @@ export class LeaderElectionService {
         lease.spec.acquireTime = new V1MicroTime(new Date());
         lease.spec.renewTime = new V1MicroTime(new Date());
 
-        try {
-            const { body } = await this.kubeClient.replaceNamespacedLease(this.leaseName, this.namespace, lease);
-            this.logger.info("Successfully acquired lease");
-            return body;
-        } catch (error) {
-            this.logger.error({ message: "Error while acquiring lease", error });
-            throw error;
-        }
+        const { body } = await this.kubeClient.replaceNamespacedLease(this.leaseName, this.namespace, lease);
+        this.logger.info("Successfully acquired lease");
+        return body;
     }
 
     private async renewLease() {
+        if (this.stopped || !this.isLeader) return;
+        const version = this.leaseUpdateVersion;
         try {
-            let lease: V1Lease = await this.getLease();
-            if (this.isLeaseHeldByUs(lease)) {
-                this.logger.debug("Renewing lease...");
-                lease.spec!.renewTime = new V1MicroTime(new Date());
-                try {
-                    const { body } = await this.kubeClient.replaceNamespacedLease(this.leaseName, this.namespace, lease);
-                    this.logger.debug("Successfully renewed lease");
-                    return body;
-                } catch (error) {
-                    this.logger.error({ message: "Error while renewing lease", error });
-                    throw error;
-                }
-            } else {
+            const lease = await this.getLease();
+            if (this.stopped || !this.isLeader || version !== this.leaseUpdateVersion) return;
+            if (!this.isLeaseHeldByUs(lease)) {
                 this.loseLeadership();
+                return;
             }
+            this.logger.debug("Renewing lease...");
+            lease.spec!.renewTime = new V1MicroTime(new Date());
+            const { body } = await this.kubeClient.replaceNamespacedLease(this.leaseName, this.namespace, lease);
+            if (this.stopped || !this.isLeader || version !== this.leaseUpdateVersion) return;
+            this.scheduleLeaseExpiry(body);
+            this.logger.debug("Successfully renewed lease");
+            return body;
         } catch (error) {
             this.logger.error({ message: "Error while renewing lease", error });
-            this.loseLeadership();
+            if (version === this.leaseUpdateVersion) this.loseLeadership();
         }
     }
 
@@ -153,12 +188,11 @@ export class LeaderElectionService {
             const { body } = await this.kubeClient.readNamespacedLease(this.leaseName, this.namespace);
             return body;
         } catch (error) {
-            if (error instanceof Error && (error as any).response?.statusCode === 404) {
+            if (!this.stopped && error instanceof Error && (error as any).response?.statusCode === 404) {
                 this.logger.info("Lease not found. Creating lease...");
                 return this.createLease();
-            } else {
-                throw error;
             }
+            throw error;
         }
     }
 
@@ -176,14 +210,9 @@ export class LeaderElectionService {
             },
         };
 
-        try {
-            const { body } = await this.kubeClient.createNamespacedLease(this.namespace, lease);
-            this.logger.info("Successfully created lease");
-            return body;
-        } catch (error) {
-            this.logger.error({ message: "Failed to create lease", error });
-            throw error;
-        }
+        const { body } = await this.kubeClient.createNamespacedLease(this.namespace, lease);
+        this.logger.info("Successfully created lease");
+        return body;
     }
 
     private isLeaseExpired(lease: V1Lease): boolean {
@@ -196,16 +225,29 @@ export class LeaderElectionService {
         return lease.spec!.holderIdentity === this.LEADER_IDENTITY;
     }
 
-    private async gracefulShutdown() {
+    public async gracefulShutdown() {
+        if (this.stopped) return;
+        this.stopped = true;
+        this.eventEmitter.emit("shutdown");
         this.logger.info("Graceful shutdown initiated");
-        if (this.isLeader) {
+        const wasLeader = this.isLeader;
+        if (this.leaseRenewalTimeout) clearTimeout(this.leaseRenewalTimeout);
+        if (this.notLeaderRetryTimeout) clearTimeout(this.notLeaderRetryTimeout);
+        if (this.watchRetryTimeout) clearTimeout(this.watchRetryTimeout);
+        this.leaseRenewalTimeout = this.notLeaderRetryTimeout = this.watchRetryTimeout = null;
+        this.watchRequest?.abort();
+        this.watchRequest = null;
+        process.removeListener("SIGINT", this.onSignal);
+        process.removeListener("SIGTERM", this.onSignal);
+        this.loseLeadership();
+        if (wasLeader && this.kubeClient) {
             await this.releaseLease();
         }
     }
 
     private async releaseLease(): Promise<void> {
         try {
-            let lease = await this.getLease();
+            const { body: lease } = await this.kubeClient.readNamespacedLease(this.leaseName, this.namespace);
             if (lease && this.isLeaseHeldByUs(lease)) {
                 lease.spec!.holderIdentity = undefined;
                 lease.spec!.renewTime = undefined;
@@ -213,6 +255,7 @@ export class LeaderElectionService {
                 this.logger.info(`Lease for ${this.leaseName} released.`);
             }
         } catch (error) {
+            if ((error as any)?.response?.statusCode === 404) return;
             this.logger.error({ message: "Failed to release lease", error });
         }
     }
@@ -227,7 +270,9 @@ export class LeaderElectionService {
         this.logger.info(`Instance lost the leadership for lease: ${this.leaseName}`);
     }
 
-    private becomeLeader() {
+    private becomeLeader(lease: V1Lease) {
+        if (this.stopped) return;
+        if (!this.scheduleLeaseExpiry(lease)) return;
         this.isLeader = true;
         this.emitLeaderElectedEvent();
         this.scheduleLeaseRenewal();
@@ -240,6 +285,9 @@ export class LeaderElectionService {
     private loseLeadership() {
         if (this.isLeader) {
             this.isLeader = false;
+            this.leaseUpdateVersion++;
+            if (this.leaseExpiryTimeout) clearTimeout(this.leaseExpiryTimeout);
+            this.leaseExpiryTimeout = null;
             if (this.leaseRenewalTimeout) {
                 clearTimeout(this.leaseRenewalTimeout);
                 this.leaseRenewalTimeout = null;
@@ -250,95 +298,104 @@ export class LeaderElectionService {
     }
 
     private scheduleNotLeaderRetry() {
-        if (this.isLeader) return;
+        if (this.stopped || this.isLeader) return;
         if (this.notLeaderRetryTimeout) {
             clearTimeout(this.notLeaderRetryTimeout);
         }
-        this.notLeaderRetryTimeout = setTimeout(async () => {
-            if (!this.isLeader) {
-                await this.tryToBecomeLeader();
-                this.scheduleNotLeaderRetry();
-            }
-        }, this.renewalInterval);
+        this.notLeaderRetryTimeout = setTimeout(() => this.runLeaderElectionProcess(), this.renewalInterval);
     }
 
     private async watchLeaseObject() {
+        if (this.stopped) return;
+        const reconnect = (error?: unknown) => {
+            if (this.stopped) return;
+            if (error) {
+                this.logger.error({ message: "Lease watch failed; retrying in 5 seconds", error });
+            } else {
+                this.logger.info("Watch for lease gracefully closed");
+            }
+            this.watchRetryTimeout = setTimeout(() => this.watchLeaseObject(), 5000);
+        };
         const path = `/apis/coordination.k8s.io/v1/namespaces/${this.namespace}/leases`;
         try {
-            await this.watch.watch(
+            const request = await this.watch.watch(
                 path,
                 {},
                 (type, apiObj) => {
-                    if (apiObj && apiObj.metadata.name === this.leaseName) {
-                        this.logger.debug(`Watch event type: ${type} for lease: ${this.leaseName}`);
-                        switch (type) {
-                            case "ADDED":
-                            case "MODIFIED":
-                                setTimeout(() => this.handleLeaseUpdate(apiObj), 2000);
-                                break;
-                            case "DELETED":
-                                setTimeout(() => this.handleLeaseDeletion(), 2000);
-                                break;
-                        }
+                    if (this.stopped || !apiObj || apiObj.metadata.name !== this.leaseName) return;
+                    this.logger.debug(`Watch event type: ${type} for lease: ${this.leaseName}`);
+                    switch (type) {
+                        case "ADDED":
+                        case "MODIFIED":
+                            this.handleLeaseUpdate(apiObj);
+                            break;
+                        case "DELETED":
+                            this.handleLeaseDeletion();
+                            break;
                     }
                 },
-                (err) => {
-                    if (err) {
-                        this.logger.error({
-                            message: `Watch for lease ended with error: ${err}, trying again in 5 seconds`,
-                            error: err,
-                        });
-                    } else {
-                        this.logger.info("Watch for lease gracefully closed");
-                    }
-                    setTimeout(() => this.watchLeaseObject(), 5000);
-                }
+                reconnect,
             );
+            if (this.stopped) request.abort();
+            else this.watchRequest = request;
         } catch (err) {
-            this.logger.error(`Failed to start watch for lease: ${err}, trying again in 5 seconds`);
-            setTimeout(() => this.watchLeaseObject(), 5000);
+            reconnect(err);
         }
     }
 
     private scheduleLeaseRenewal() {
+        if (this.stopped) return;
         if (this.leaseRenewalTimeout) {
             clearTimeout(this.leaseRenewalTimeout);
         }
 
         this.leaseRenewalTimeout = setTimeout(async () => {
+            this.leaseRenewalTimeout = null;
+            const version = this.leaseUpdateVersion;
             if (this.isLeader) {
                 try {
                     await this.renewLease();
                 } catch (error) {
                     this.logger.error({ message: "Error while renewing lease", error });
                 }
+                if (this.isLeader && version === this.leaseUpdateVersion) {
+                    this.scheduleLeaseRenewal();
+                }
             }
         }, this.renewalInterval);
+    }
+
+    private scheduleLeaseExpiry(lease: V1Lease): boolean {
+        if (this.leaseExpiryTimeout) clearTimeout(this.leaseExpiryTimeout);
+        this.leaseExpiryTimeout = null;
+        // Count from the timestamp written to the lease, not from the response arrival.
+        const expiresAt = new Date(lease.spec!.renewTime!).getTime() + lease.spec!.leaseDurationSeconds! * 1000;
+        const remaining = expiresAt - Date.now();
+        if (remaining <= 0) {
+            this.loseLeadership();
+            return false;
+        }
+        this.leaseExpiryTimeout = setTimeout(() => this.loseLeadership(), remaining);
+        return true;
     }
 
     private handleLeaseUpdate(leaseObj: V1Lease) {
         if (this.isLeaseHeldByUs(leaseObj)) {
             if (!this.isLeader) {
-                setTimeout(() => {
-                    this.becomeLeader();
-                }, 2000);
+                this.tryToBecomeLeader();
             }
-            this.scheduleLeaseRenewal();
-        } else if (!leaseObj.spec?.holderIdentity) {
-            this.tryToBecomeLeader();
-        } else if (this.isLeader) {
+        } else {
+            this.leaseUpdateVersion++;
             this.loseLeadership();
+            if (!leaseObj.spec?.holderIdentity) {
+                this.tryToBecomeLeader();
+            }
         }
     }
 
     private handleLeaseDeletion() {
-        if (!this.isLeader) {
-            this.tryToBecomeLeader().catch((error) => {
-                this.logger.error({
-                    message: "Error while trying to become leader after lease deletion",
-                    error,
-                });
-            });
-        }
+        this.leaseUpdateVersion++;
+        this.loseLeadership();
+        this.tryToBecomeLeader();
     }
 }

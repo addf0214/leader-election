@@ -1,13 +1,16 @@
 {
   "name": "leader-election",
-  "version": "1.0.2",
+  "version": "1.1.0",
   "description": "Lightweight leader-election utility for Node.js services on Kubernetes, powered by Lease objects.",
   "main": "lib/index.js",
   "types": "lib/index.d.ts",
+  "engines": {
+    "node": ">=20.16.0"
+  },
   "scripts": {
     "build": "tsc",
     "prepublishOnly": "npm run build",
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test": "npm run build && node --test test/*.test.cjs"
   },
   "repository": {
     "type": "git",
@@ -24,7 +27,7 @@
     "distributed"
   ],
   "author": "Addf",
-  "license": "ISC",
+  "license": "MIT",
   "bugs": {
     "url": "https://github.com/addf0214/leader-election/issues"
   },
