@@ -139,6 +139,19 @@ test('Watch release triggers acquisition without the two-second delay', async t 
     assert.equal(fixture.service.isLeader, true);
 });
 
+test('an existing Lease without spec can be acquired through Watch', async t => {
+    const fixture = setup(t, false);
+    delete fixture.lease.spec;
+    fixture.lease.metadata.resourceVersion = '7';
+    const notify = await watchEvents(fixture.service);
+    notify('ADDED', fixture.lease);
+    await tick(t, 0);
+    assert.equal(fixture.writes, 1);
+    assert.equal(fixture.service.isLeader, true);
+    assert.equal(fixture.lease.spec.holderIdentity, fixture.service.LEADER_IDENTITY);
+    assert.equal(fixture.lease.metadata.resourceVersion, '7');
+});
+
 test('repeated self Watch events share one election and require a successful write', async t => {
     const { service, lease } = setup(t, false);
     let finish;
@@ -372,6 +385,28 @@ test('an acquisition response already expired cannot elect a leader', async t =>
     assert.equal(service.leaseExpiryTimeout, null);
 });
 
+test('a Lease is expired at its deadline and cannot start leadership', async t => {
+    const { service, lease } = setup(t, false);
+    await tick(t, 1999);
+    assert.equal(service.isLeaseExpired(lease), false);
+    await tick(t, 1);
+    assert.equal(service.isLeaseExpired(lease), true);
+    service.becomeLeader(lease);
+    assert.equal(service.isLeader, false);
+    assert.equal(service.leaseExpiryTimeout, null);
+});
+
+test('missing or invalid renewal timestamps cannot start leadership', t => {
+    const { service, lease } = setup(t, false);
+    for (const renewTime of [undefined, 'invalid-date']) {
+        lease.spec.renewTime = renewTime;
+        assert.equal(service.isLeaseExpired(lease), true);
+        service.becomeLeader(lease);
+        assert.equal(service.isLeader, false);
+        assert.equal(service.leaseExpiryTimeout, null);
+    }
+});
+
 test('shutdown clears the expiry timer', async t => {
     const { service } = setup(t);
     assert.ok(service.leaseExpiryTimeout);
@@ -448,6 +483,23 @@ async function setupHttpClient(t, handler, options = {}) {
     t.after(() => service.gracefulShutdown());
     return service;
 }
+
+test('SDK Watch sends a selector for the configured Lease', { timeout: 5000 }, async t => {
+    let query;
+    const service = await setupHttpClient(t, (request, response) => {
+        query = new URL(request.url, 'http://localhost').searchParams;
+        response.setHeader('Content-Type', 'application/json');
+        response.flushHeaders();
+    }, { leaseName: 'background-jobs' });
+    await service.watchLeaseObject();
+    assert.equal(query.get('watch'), 'true');
+    assert.equal(query.get('fieldSelector'), 'metadata.name=background-jobs');
+    const controller = service.watchRequest;
+    assert.equal(controller.signal.aborted, false);
+    await service.gracefulShutdown();
+    assert.equal(controller.signal.aborted, true);
+    assert.equal(service.watchRequest, null);
+});
 
 test('SDK lease requests time out and subsequent requests can succeed', { timeout: 5000 }, async t => {
     let respond = false;

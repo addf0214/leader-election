@@ -2,17 +2,11 @@
 
 Leader election for Node.js services using Kubernetes [Lease objects](https://kubernetes.io/docs/concepts/architecture/leases/). Written in TypeScript, with no framework dependency.
 
-## Why this project
-
-Inspired by [Precise-Finance/nestjs-k8s-leader-election](https://github.com/Precise-Finance/nestjs-k8s-leader-election), this project was rewritten to remove the NestJS dependency and address bugs in lease renewal, leadership changes, and error handling. The aim is a small library that can be used directly in any Node.js service.
-
 ## Features
 
-- Coordinates instances through the Kubernetes Lease API.
-- Emits `leaderElected` and `leaderLost` events to start and stop leader tasks.
-- Can wait for leadership before initialization completes.
-- Renews leases automatically and detects leadership loss through Watch notifications, renewal failures, and lease expiry.
-- Simulates leadership for local development outside Kubernetes.
+- Leadership events and optional waiting for leadership during initialization.
+- Automatic lease renewal and leadership loss detection through Watch, renewal failures, and lease expiry.
+- Local development mode without Kubernetes.
 
 ## Installation
 
@@ -23,6 +17,8 @@ pnpm add leader-election
 ```
 
 Requires Node.js 22.19.0 or later and Kubernetes 1.14 or later with the coordination API enabled. The package includes `@kubernetes/client-node` 2.x. CommonJS `require` and ESM `import` are supported.
+
+When upgrading from 1.1.x, constructor options, events, `initialize()`, and `gracefulShutdown()` remain unchanged. The breaking change in 2.0 is the higher Node.js requirement.
 
 The service account needs `get`, `create`, `update`, and `watch` permissions on `leases` in the `coordination.k8s.io` API group.
 

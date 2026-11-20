@@ -221,14 +221,20 @@ export class LeaderElectionService {
         return body;
     }
 
+    private getLeaseExpiryTime(lease: V1Lease): number {
+        const renewTime = lease.spec?.renewTime;
+        if (!renewTime) return 0;
+        const duration = lease.spec?.leaseDurationSeconds ?? this.durationInSeconds;
+        const expiresAt = new Date(renewTime).getTime() + duration * 1000;
+        return Number.isFinite(expiresAt) ? expiresAt : 0;
+    }
+
     private isLeaseExpired(lease: V1Lease): boolean {
-        const renewTime = lease.spec!.renewTime ? new Date(lease.spec!.renewTime).getTime() : 0;
-        const leaseDurationMs = (lease.spec!.leaseDurationSeconds || this.durationInSeconds) * 1000;
-        return Date.now() > renewTime + leaseDurationMs;
+        return Date.now() >= this.getLeaseExpiryTime(lease);
     }
 
     private isLeaseHeldByUs(lease: V1Lease): boolean {
-        return lease.spec!.holderIdentity === this.LEADER_IDENTITY;
+        return lease.spec?.holderIdentity === this.LEADER_IDENTITY;
     }
 
     public async gracefulShutdown() {
@@ -326,7 +332,7 @@ export class LeaderElectionService {
         try {
             const request = await this.watch.watch(
                 path,
-                {},
+                { fieldSelector: `metadata.name=${this.leaseName}` },
                 (type, apiObj) => {
                     if (this.stopped || !apiObj || apiObj.metadata.name !== this.leaseName) return;
                     this.logger.debug(`Watch event type: ${type} for lease: ${this.leaseName}`);
@@ -375,8 +381,7 @@ export class LeaderElectionService {
         if (this.leaseExpiryTimeout) clearTimeout(this.leaseExpiryTimeout);
         this.leaseExpiryTimeout = null;
         // Count from the timestamp written to the lease, not from the response arrival.
-        const expiresAt = new Date(lease.spec!.renewTime!).getTime() + lease.spec!.leaseDurationSeconds! * 1000;
-        const remaining = expiresAt - Date.now();
+        const remaining = this.getLeaseExpiryTime(lease) - Date.now();
         if (remaining <= 0) {
             this.loseLeadership();
             return false;

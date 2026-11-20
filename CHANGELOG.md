@@ -7,6 +7,11 @@
 - Upgrade `@kubernetes/client-node` from 0.22.x to 2.x, removing the deprecated `request` dependency.
 - Require Node.js 22.19.0 or later to match the new SDK's dependencies. CommonJS and ESM usage remain supported.
 - Adapt Lease API calls, error handling, and request timeouts to the new SDK. The public API and Watch-based election behavior remain unchanged.
+- Filter Watch subscriptions by Lease name on the server.
+
+### Fixed
+
+- Handle existing Leases without `spec` and use consistent expiry checks for election and renewal. Missing or invalid renewal timestamps are treated as expired.
 
 ## [1.1.0] - 2026-11-17
 
