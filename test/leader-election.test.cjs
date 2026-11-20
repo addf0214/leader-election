@@ -29,8 +29,8 @@ function setup(t, leader = true, options = {}) {
     const lease = { metadata: { name: 'leader-election' }, spec: { holderIdentity: service.LEADER_IDENTITY, renewTime: new Date(), leaseDurationSeconds: service.durationInSeconds } };
     let writes = 0;
     service.kubeClient = {
-        async readNamespacedLease() { return { body: lease }; },
-        async replaceNamespacedLease() { writes++; return { body: lease }; },
+        async readNamespacedLease() { return lease; },
+        async replaceNamespacedLease() { writes++; return lease; },
     };
     if (leader) service.becomeLeader(lease);
     return { service, lease, get writes() { return writes; } };
@@ -68,7 +68,7 @@ test('the next renewal waits for the current request to finish', async t => {
     service.kubeClient.replaceNamespacedLease = async () => {
         calls++;
         if (calls === 1) await new Promise(resolve => { finish = resolve; });
-        return { body: lease };
+        return lease;
     };
     await tick(t, 10000);
     assert.equal(calls, 1);
@@ -122,7 +122,7 @@ test('a stale self Watch event cannot promote when the API reports another holde
     let elected = 0;
     service.on('leaderElected', () => elected++);
     service.kubeClient.readNamespacedLease = async () => ({
-        body: { ...lease, spec: { ...lease.spec, holderIdentity: 'other-pod', leaseDurationSeconds: 20 } },
+        ...lease, spec: { ...lease.spec, holderIdentity: 'other-pod', leaseDurationSeconds: 20 },
     });
     service.handleLeaseUpdate(lease);
     await tick(t, 4000);
@@ -148,7 +148,7 @@ test('repeated self Watch events share one election and require a successful wri
     service.kubeClient.replaceNamespacedLease = async () => {
         writes++;
         await new Promise(resolve => { finish = resolve; });
-        return { body: lease };
+        return lease;
     };
     service.handleLeaseUpdate(lease);
     service.handleLeaseUpdate(lease);
@@ -168,7 +168,7 @@ test('ownership changes during an acquisition invalidate its late response', asy
     service.on('leaderElected', () => elected++);
     service.kubeClient.replaceNamespacedLease = async () => {
         await new Promise(resolve => { finish = resolve; });
-        return { body: lease };
+        return lease;
     };
     service.handleLeaseUpdate(lease);
     await tick(t, 0);
@@ -213,7 +213,7 @@ test('shutdown cancels follower retries and an already scheduled Watch reconnect
     lease.spec.holderIdentity = 'another-pod';
     let reads = 0;
     let watches = 0;
-    service.kubeClient.readNamespacedLease = async () => { reads++; return { body: lease }; };
+    service.kubeClient.readNamespacedLease = async () => { reads++; return lease; };
     service.watch = { async watch() { watches++; throw new Error('offline'); } };
     service.scheduleNotLeaderRetry();
     await service.watchLeaseObject();
@@ -229,7 +229,7 @@ test('shutdown does not create a missing Lease while releasing', async t => {
     const { service } = setup(t);
     let creates = 0;
     service.kubeClient.readNamespacedLease = async () => {
-        throw Object.assign(new Error('Not found'), { response: { statusCode: 404 } });
+        throw Object.assign(new Error('Not found'), { code: 404 });
     };
     service.kubeClient.createNamespacedLease = async () => { creates++; };
     await service.gracefulShutdown();
@@ -332,7 +332,7 @@ for (const blockedRequest of ['read', 'write']) {
         assert.equal(service.isLeader, false);
         assert.equal(lost, 1);
         assert.equal(service.leaseExpiryTimeout, null);
-        finish({ body: lease });
+        finish(lease);
         await tick(t, 0);
         assert.equal(service.isLeader, false);
         assert.equal(elected, 0);
@@ -348,13 +348,13 @@ test('renewal refreshes expiry from its write timestamp rather than response arr
     await tick(t, 1000);
     const response = JSON.parse(JSON.stringify(lease));
     await tick(t, 500);
-    finish({ body: response });
+    finish(response);
     await tick(t, 0);
     await tick(t, 1499);
     assert.equal(service.isLeader, true);
     await tick(t, 1);
     assert.equal(service.isLeader, false);
-    finish({ body: lease });
+    finish(lease);
     await tick(t, 0);
     await service.gracefulShutdown();
 });
@@ -366,7 +366,7 @@ test('an acquisition response already expired cannot elect a leader', async t =>
     const election = service.tryToBecomeLeader();
     await tick(t, 0);
     await tick(t, 2000);
-    finish({ body: lease });
+    finish(lease);
     await election;
     assert.equal(service.isLeader, false);
     assert.equal(service.leaseExpiryTimeout, null);
@@ -418,17 +418,10 @@ test('invalid renewal intervals fail before signal listeners are registered', ()
     assert.equal(process.listenerCount('SIGTERM'), listeners);
 });
 
-test('SDK lease requests time out and subsequent requests can succeed', { timeout: 5000 }, async t => {
+async function setupHttpClient(t, handler, options = {}) {
     const http = require('node:http');
     const { KubeConfig } = require('@kubernetes/client-node');
-    let respond = false;
-    let requests = 0;
-    const server = http.createServer((request, response) => {
-        requests++;
-        if (!respond) return;
-        response.setHeader('Content-Type', 'application/json');
-        response.end(JSON.stringify({ metadata: { name: 'leader-election' }, spec: {} }));
-    });
+    const server = http.createServer(handler);
     await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
     t.after(() => {
         server.closeAllConnections();
@@ -436,7 +429,8 @@ test('SDK lease requests time out and subsequent requests can succeed', { timeou
     });
     t.mock.method(KubeConfig.prototype, 'loadFromDefault', function () {
         this.loadFromOptions({
-            clusters: [{ name: 'test', server: 'http://127.0.0.1:' + server.address().port }],
+            // The test server uses plain HTTP on loopback.
+            clusters: [{ name: 'test', server: 'http://127.0.0.1:' + server.address().port, skipTLSVerify: true }],
             users: [{ name: 'test' }],
             contexts: [{ name: 'test', cluster: 'test', user: 'test' }],
             currentContext: 'test',
@@ -446,18 +440,81 @@ test('SDK lease requests time out and subsequent requests can succeed', { timeou
     process.env.KUBERNETES_SERVICE_HOST = 'test';
     let service;
     try {
-        service = new LeaderElectionService({ renewalInterval: 100 });
+        service = new LeaderElectionService({ logger: { info() {}, debug() {}, error() {} }, ...options });
     } finally {
         if (host === undefined) delete process.env.KUBERNETES_SERVICE_HOST;
         else process.env.KUBERNETES_SERVICE_HOST = host;
     }
     t.after(() => service.gracefulShutdown());
-    await assert.rejects(service.kubeClient.readNamespacedLease('leader-election', 'default'), error =>
-        error.code === 'ETIMEDOUT' || error.code === 'ESOCKETTIMEDOUT');
+    return service;
+}
+
+test('SDK lease requests time out and subsequent requests can succeed', { timeout: 5000 }, async t => {
+    let respond = false;
+    let requests = 0;
+    const service = await setupHttpClient(t, (request, response) => {
+        requests++;
+        if (!respond) return;
+        response.setHeader('Content-Type', 'application/json');
+        response.end(JSON.stringify({ metadata: { name: 'leader-election' }, spec: {} }));
+    }, { renewalInterval: 100 });
+    await assert.rejects(service.getLease(), error => error.name === 'TimeoutError');
     respond = true;
-    const { body } = await service.kubeClient.readNamespacedLease('leader-election', 'default');
+    const body = await service.getLease();
     assert.equal(body.metadata.name, 'leader-election');
     assert.equal(requests, 2);
+});
+
+test('SDK handles Lease creation, conflicts, timestamps, and release through HTTP', { timeout: 5000 }, async t => {
+    let lease;
+    let conflict = true;
+    const writes = [];
+    const errors = [];
+    const service = await setupHttpClient(t, async (request, response) => {
+        response.setHeader('Content-Type', 'application/json');
+        if (request.method === 'GET') {
+            response.statusCode = lease ? 200 : 404;
+            response.end(JSON.stringify(lease ?? { kind: 'Status', reason: 'NotFound', code: 404 }));
+            return;
+        }
+        let body = '';
+        for await (const chunk of request) body += chunk;
+        const input = JSON.parse(body);
+        writes.push({ method: request.method, url: request.url, body: input });
+        if (request.method === 'PUT' && conflict) {
+            response.statusCode = 409;
+            response.end(JSON.stringify({ kind: 'Status', reason: 'Conflict', code: 409 }));
+            return;
+        }
+        lease = { ...input, metadata: { ...input.metadata, resourceVersion: String(writes.length) } };
+        response.statusCode = request.method === 'POST' ? 201 : 200;
+        response.end(JSON.stringify(lease));
+    }, { logger: { info() {}, debug() {}, error(error) { errors.push(error); } } });
+
+    await service.tryToBecomeLeader();
+    assert.equal(service.isLeader, false);
+    assert.equal(errors[0].error.code, 409);
+    assert.equal(writes[0].method, 'POST');
+    assert.equal(writes[0].url, '/apis/coordination.k8s.io/v1/namespaces/default/leases');
+    assert.equal(writes[1].body.metadata.resourceVersion, '1');
+    assert.match(writes[0].body.spec.renewTime, /\.\d{6}Z$/);
+    assert.ok(Number.isFinite(Date.parse(writes[0].body.spec.acquireTime)));
+
+    conflict = false;
+    await service.tryToBecomeLeader();
+    assert.equal(service.isLeader, true);
+    assert.equal(lease.spec.holderIdentity, service.LEADER_IDENTITY);
+    await service.renewLease();
+    assert.equal(service.isLeader, true);
+    await service.gracefulShutdown();
+    assert.equal(lease.spec.holderIdentity, undefined);
+    assert.equal(lease.spec.renewTime, undefined);
+
+    lease = undefined;
+    const writeCount = writes.length;
+    await service.releaseLease();
+    assert.equal(writes.length, writeCount);
+    assert.equal(errors.length, 1);
 });
 
 test('an old renewal callback does not postpone the new leadership renewal', async t => {
@@ -467,7 +524,7 @@ test('an old renewal callback does not postpone the new leadership renewal', asy
     service.kubeClient.replaceNamespacedLease = async () => {
         const body = JSON.parse(JSON.stringify(lease));
         if (++writes === 1) await new Promise(resolve => { finish = resolve; });
-        return { body };
+        return body;
     };
     await tick(t, 1000);
     await tick(t, 100);

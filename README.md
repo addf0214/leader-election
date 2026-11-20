@@ -22,7 +22,7 @@ npm install leader-election
 pnpm add leader-election
 ```
 
-Requires Node.js 20.16.0 or later and Kubernetes 1.14 or later with the coordination API enabled. The package includes `@kubernetes/client-node` 0.22.x.
+Requires Node.js 22.19.0 or later and Kubernetes 1.14 or later with the coordination API enabled. The package includes `@kubernetes/client-node` 2.x. CommonJS `require` and ESM `import` are supported.
 
 The service account needs `get`, `create`, `update`, and `watch` permissions on `leases` in the `coordination.k8s.io` API group.
 

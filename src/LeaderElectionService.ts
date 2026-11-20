@@ -1,4 +1,4 @@
-import { CoordinationV1Api, KubeConfig, V1Lease, V1MicroTime, Watch } from "@kubernetes/client-node";
+import { ConfigurationOptions, CoordinationV1Api, KubeConfig, Observable, V1Lease, V1MicroTime, Watch } from "@kubernetes/client-node";
 import { EventEmitter } from "events";
 import { randomBytes } from "crypto";
 
@@ -22,6 +22,16 @@ export class LeaderElectionService {
     private leaseName: string;
     private namespace: string;
     private renewalInterval: number;
+    private readonly requestOptions: ConfigurationOptions = {
+        middlewareMergeStrategy: "append",
+        middleware: [{
+            pre: (request) => {
+                request.setSignal(AbortSignal.timeout(this.renewalInterval));
+                return new Observable(Promise.resolve(request));
+            },
+            post: (response) => new Observable(Promise.resolve(response)),
+        }],
+    };
     private durationInSeconds: number;
     private isLeader = false;
     private electionInProgress = false;
@@ -45,9 +55,6 @@ export class LeaderElectionService {
         if (process.env.KUBERNETES_SERVICE_HOST) {
             kubeConfig.loadFromDefault();
             this.kubeClient = kubeConfig.makeApiClient(CoordinationV1Api);
-            this.kubeClient.addInterceptor((request) => {
-                request.timeout = this.renewalInterval;
-            });
             this.watch = new Watch(kubeConfig);
         } else {
             this.logger.info("Not running in Kubernetes environment. Leader election will be simulated.");
@@ -155,7 +162,7 @@ export class LeaderElectionService {
         lease.spec.acquireTime = new V1MicroTime(new Date());
         lease.spec.renewTime = new V1MicroTime(new Date());
 
-        const { body } = await this.kubeClient.replaceNamespacedLease(this.leaseName, this.namespace, lease);
+        const body = await this.kubeClient.replaceNamespacedLease({ name: this.leaseName, namespace: this.namespace, body: lease }, this.requestOptions);
         this.logger.info("Successfully acquired lease");
         return body;
     }
@@ -172,7 +179,7 @@ export class LeaderElectionService {
             }
             this.logger.debug("Renewing lease...");
             lease.spec!.renewTime = new V1MicroTime(new Date());
-            const { body } = await this.kubeClient.replaceNamespacedLease(this.leaseName, this.namespace, lease);
+            const body = await this.kubeClient.replaceNamespacedLease({ name: this.leaseName, namespace: this.namespace, body: lease }, this.requestOptions);
             if (this.stopped || !this.isLeader || version !== this.leaseUpdateVersion) return;
             this.scheduleLeaseExpiry(body);
             this.logger.debug("Successfully renewed lease");
@@ -185,10 +192,9 @@ export class LeaderElectionService {
 
     private async getLease(): Promise<V1Lease> {
         try {
-            const { body } = await this.kubeClient.readNamespacedLease(this.leaseName, this.namespace);
-            return body;
+            return await this.kubeClient.readNamespacedLease({ name: this.leaseName, namespace: this.namespace }, this.requestOptions);
         } catch (error) {
-            if (!this.stopped && error instanceof Error && (error as any).response?.statusCode === 404) {
+            if (!this.stopped && (error as any)?.code === 404) {
                 this.logger.info("Lease not found. Creating lease...");
                 return this.createLease();
             }
@@ -210,7 +216,7 @@ export class LeaderElectionService {
             },
         };
 
-        const { body } = await this.kubeClient.createNamespacedLease(this.namespace, lease);
+        const body = await this.kubeClient.createNamespacedLease({ namespace: this.namespace, body: lease }, this.requestOptions);
         this.logger.info("Successfully created lease");
         return body;
     }
@@ -247,15 +253,15 @@ export class LeaderElectionService {
 
     private async releaseLease(): Promise<void> {
         try {
-            const { body: lease } = await this.kubeClient.readNamespacedLease(this.leaseName, this.namespace);
+            const lease = await this.kubeClient.readNamespacedLease({ name: this.leaseName, namespace: this.namespace }, this.requestOptions);
             if (lease && this.isLeaseHeldByUs(lease)) {
                 lease.spec!.holderIdentity = undefined;
                 lease.spec!.renewTime = undefined;
-                await this.kubeClient.replaceNamespacedLease(this.leaseName, this.namespace, lease);
+                await this.kubeClient.replaceNamespacedLease({ name: this.leaseName, namespace: this.namespace, body: lease }, this.requestOptions);
                 this.logger.info(`Lease for ${this.leaseName} released.`);
             }
         } catch (error) {
-            if ((error as any)?.response?.statusCode === 404) return;
+            if ((error as any)?.code === 404) return;
             this.logger.error({ message: "Failed to release lease", error });
         }
     }
